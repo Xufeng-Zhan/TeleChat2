@@ -54,13 +54,13 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers import GenerationConfig
 
-from .configuration_telechat2 import Telechat2Config
-
+from .configuration_telechat import TelechatConfig
+from .generation_utils import History, TelechatIterTextStreamer
 
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "telechat"
-_CONFIG_FOR_DOC = "Telechat2Config"
+_CONFIG_FOR_DOC = "TelechatConfig"
 
 TELECHAT_PRETRAINED_MODEL_ARCHIVE_LIST = []
 
@@ -192,7 +192,7 @@ class FlashSelfAttention(torch.nn.Module):
         q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
                                     device=q.device)
-        self.training = False
+        # self.training = False
         if self.training:
             # during training q,k,v always have same seqlen
             assert seqlen_k == seqlen_q
@@ -330,7 +330,7 @@ class TelechatGelu(nn.Module):
 
 
 class TelechatAttention(nn.Module):
-    def __init__(self, config: Telechat2Config, layer_idx):
+    def __init__(self, config: TelechatConfig, layer_idx):
         super().__init__()
         self.kv_cache = None
         self.layer_idx = layer_idx
@@ -410,20 +410,14 @@ class TelechatAttention(nn.Module):
             use_cache: bool = False,
             output_attentions: bool = False,
     ):
-        # hidden_states = hidden_states.transpose(1, 0)
+        hidden_states = hidden_states.transpose(1, 0)
         query_layer = self.query(hidden_states)
-
-        query_layer = query_layer.transpose(1, 0)
-
         new_tensor_shape = query_layer.size()[:-1] + \
                            (self.num_heads,
                             self.head_dim)
         query_layer = query_layer.view(*new_tensor_shape)
 
         mixed_kv_layer = self.key_value(hidden_states)
-
-        mixed_kv_layer = mixed_kv_layer.transpose(1, 0)
-
         new_tensor_shape = mixed_kv_layer.size()[:-1] + \
                            (self.num_key_value_heads,
                             2 * self.head_dim)
@@ -437,8 +431,8 @@ class TelechatAttention(nn.Module):
                        key_layer.size(2)
                        )
 
-        query_layer = query_layer.reshape((output_size[2], output_size[0] * output_size[1], -1))
-        key_layer = key_layer.reshape((output_size[3], output_size[0] * output_size[4], -1))
+        query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
+        key_layer = key_layer.view(output_size[3], output_size[0] * output_size[4], -1)
 
         apply_rotary_fn = apply_rotary_pos_emb_torch
 
@@ -509,7 +503,7 @@ class TelechatAttention(nn.Module):
 
 
 class TelechatMLP(nn.Module):
-    def __init__(self, config: Telechat2Config):
+    def __init__(self, config: TelechatConfig):
         super().__init__()
         hidden_size = config.hidden_size
         self.gate_proj = nn.Linear(hidden_size, config.ffn_hidden_size, bias=False)
@@ -524,7 +518,7 @@ class TelechatMLP(nn.Module):
 
 
 class TelechatBlock(nn.Module):
-    def __init__(self, config: Telechat2Config, layer_idx):
+    def __init__(self, config: TelechatConfig, layer_idx):
         super().__init__()
         hidden_size = config.hidden_size
 
@@ -581,7 +575,7 @@ class TelechatBlock(nn.Module):
 
 
 class TelechatPreTrainedModel(PreTrainedModel):
-    config_class = Telechat2Config
+    config_class = TelechatConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
     _no_split_modules = ["TelechatBlock"]
@@ -612,7 +606,7 @@ class TelechatPreTrainedModel(PreTrainedModel):
 
 
 class TelechatModel(TelechatPreTrainedModel):
-    def __init__(self, config: Telechat2Config):
+    def __init__(self, config: TelechatConfig):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -767,11 +761,11 @@ class TelechatModel(TelechatPreTrainedModel):
         )
 
 
-class Telechat2ForCausalLM(TelechatPreTrainedModel):
+class TelechatForCausalLM(TelechatPreTrainedModel):
     # _tied_weights_keys = ["lm_head.weight"]
     _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
 
-    def __init__(self, config: Telechat2Config):
+    def __init__(self, config: TelechatConfig):
         super().__init__(config)
         self.transformer = TelechatModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -858,3 +852,88 @@ class Telechat2ForCausalLM(TelechatPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def chat(self, tokenizer, question: str = '', history: Union[List[Dict], History] = None, stream: bool = False,
+             generation_config: Optional[GenerationConfig] = None, **kwargs):
+        """
+        Args:
+            tokenizer:  the tokenizer of  telechat
+            question: question which the model reply in this turn
+            history: history which will format the input for telechat
+            stream: if return the full text at last or yield the text in token
+            generation_config:  configuration for generation
+            **kwargs: args which will update the generation config or pass to model forward
+        """
+        generation_config = generation_config or self.generation_config
+        if not generation_config:
+            logger.error("generation_config is None")
+            raise ValueError("generation_config must not be None")
+        if not question:
+            logger.error("question is empty")
+            raise ValueError("question must not be empty")
+        if history is None:
+            history = []
+
+        # we update and check generate_config here for building inputs.
+
+        generation_config = copy.deepcopy(generation_config)
+        user_id = generation_config.user_token_id
+        bot_id = generation_config.bot_token_id
+        model_kwargs = generation_config.update(**kwargs)
+        generation_config.validate()
+
+        # transfer to History
+        if not isinstance(history, History):
+            history = History(tokenizer, history)
+
+        inputs = self.build_inputs_for_chat(tokenizer, question, history, generation_config, user_id, bot_id)
+        history.append({"role": "user", "content": question})
+        if stream:
+            streamer = TelechatIterTextStreamer(tokenizer, history, skip_prompt=True)
+            Thread(target=self.generate, kwargs=dict(
+                inputs=inputs.to(self.device), streamer=streamer,
+                generation_config=generation_config, **model_kwargs
+            )).start()
+            return streamer
+        else:
+            outputs = self.generate(inputs.to(self.device), generation_config=generation_config, **model_kwargs)
+            response = tokenizer.decode(outputs[0][len(inputs[0]):-1])
+            history.append({"role": "bot", "content": response})
+            return response, history
+
+    def build_inputs_for_chat(self, tokenizer, question, history, generation_config, usr_id, bot_id):
+        """
+        check history and  build inputs here
+        """
+        # first tokenize question
+        q_token = tokenizer(question)
+        qa_history = copy.deepcopy(history)
+
+        # get the max length we should build our inputs in
+        model_max_length = self.config.seq_length
+        build_max_length = max(0, model_max_length - generation_config.max_new_tokens - 1) \
+            if generation_config.max_new_tokens else max(0, generation_config.max_length)
+        if build_max_length < 3:
+            logger.warning("the model can not meet the  requirements of input length,Please check config")
+            raise ValueError("")
+
+        # trunc left
+        input_tokens = [usr_id] + q_token["input_ids"][-build_max_length + 1:] + [bot_id]
+        length = len(input_tokens)
+
+        while len(qa_history) != 0:
+            message = qa_history.pop()
+            if message["role"] == "user":
+                tokens = [usr_id] + message["input_ids"]
+            elif message["role"] == "bot":
+                tokens = [bot_id] + message["input_ids"] + [generation_config.eos_token_id]
+            else:
+                tokens = []
+            if len(tokens) + length >= build_max_length:
+                break
+            else:
+                input_tokens = tokens + input_tokens
+
+        input_tokens = [generation_config.bos_token_id] + input_tokens
+
+        return torch.tensor([input_tokens], dtype=torch.int64)
